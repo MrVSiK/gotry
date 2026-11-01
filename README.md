@@ -6,6 +6,17 @@ hedging to outbound HTTP calls. It is an `http.RoundTripper`, so existing call
 sites keep using `client.Get` and `client.Do`, and any SDK that accepts an
 `*http.Client` picks up the behaviour.
 
+## Features
+
+- Retries with pluggable backoff (constant, exponential, full and decorrelated jitter).
+- `Retry-After` handling for 429 and 503.
+- Retry budget so retries cannot amplify an outage.
+- Per-host circuit breaker.
+- Request hedging for tail latency.
+- Per-request overrides through `context.Context`.
+- Hooks for logging and metrics.
+- No dependencies beyond the standard library.
+
 ## Install
 
 ```
@@ -60,6 +71,26 @@ body.
 | `WithHedging(delay, maxHedges)` | off | Hedged requests. Hedging is on only when both `delay` and `maxHedges` are positive. |
 | `WithHooks(h)` | none | Observability callbacks. |
 
+## Backoff strategies
+
+`WithBackoff` takes a `Backoff`: `Delay(retry int, prev time.Duration) time.Duration`,
+where `retry` is 1 for the first retry and `prev` is the previous delay (0 for
+the first). Implementations must be safe for concurrent use.
+
+| Constructor | Delay |
+| --- | --- |
+| `Constant(d)` | Always `d`. |
+| `Exponential(base, max)` | `base`, `2*base`, `4*base`, ... capped at `max`. |
+| `ExponentialJitter(base, max)` | Uniform random in `[0, exp)` where `exp` is the capped exponential value ("full jitter"). The default. |
+| `DecorrelatedJitter(base, max)` | Random duration derived from the previous delay, between `base` and `max`. |
+| `BackoffFunc(f)` | Adapts any `func(retry int, prev time.Duration) time.Duration`. |
+
+```go
+gotry.WithBackoff(gotry.BackoffFunc(func(retry int, prev time.Duration) time.Duration {
+    return time.Duration(retry) * 200 * time.Millisecond // linear: 200ms, 400ms, ...
+}))
+```
+
 ## Per-request policy
 
 `gotry.WithPolicy(ctx, gotry.Policy{...})` overrides settings for one request.
@@ -79,6 +110,104 @@ Zero-valued fields inherit the transport's setting.
 circuit breaker and hooks are transport-wide and cannot be overridden per
 request.
 
+## Examples
+
+### Retry safe reads, leave writes alone
+
+The defaults already do this: GET, HEAD, OPTIONS, TRACE, PUT and DELETE are
+retried; POST and PATCH get a single attempt.
+
+```go
+client := &http.Client{Transport: gotry.NewTransport(nil)}
+```
+
+### Safely retry a POST with an idempotency key
+
+A request carrying `Idempotency-Key` (or `X-Idempotency-Key`) is treated as
+safe to retry, provided the server honours the key.
+
+```go
+req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
+req.Header.Set("Idempotency-Key", uuid)
+resp, err := client.Do(req)
+```
+
+### Log every retry and breaker change
+
+```go
+gotry.NewTransport(nil,
+    gotry.WithCircuitBreaker(gotry.BreakerConfig{}),
+    gotry.WithHooks(gotry.Hooks{
+        OnRetry: func(e gotry.RetryEvent) {
+            log.Printf("attempt %d of %s %s failed; retrying in %s (status=%d err=%v)",
+                e.Attempt, e.Request.Method, e.Request.URL, e.Delay, e.StatusCode, e.Err)
+        },
+        OnBreakerStateChange: func(host string, from, to gotry.BreakerState) {
+            log.Printf("breaker %s: %s -> %s", host, from, to)
+        },
+    }),
+)
+```
+
+### Bound total time, not just attempts
+
+Retries stop when the request context ends, so put a deadline on the request
+and a shorter one on each attempt:
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // whole call, all attempts
+defer cancel()
+
+tr := gotry.NewTransport(nil, gotry.WithPerAttemptTimeout(1*time.Second))
+```
+
+### Hedge only the slow reads
+
+```go
+tr := gotry.NewTransport(nil, gotry.WithHedging(75*time.Millisecond, 1))
+
+// a particular call opts out:
+ctx = gotry.WithPolicy(ctx, gotry.Policy{MaxHedges: -1})
+```
+
+### Detect a rejected request and a give-up
+
+```go
+resp, err := client.Do(req)
+var ge *gotry.Error
+switch {
+case errors.Is(err, gotry.ErrCircuitOpen):
+    // rejected before any attempt: the host's breaker is open
+case errors.As(err, &ge):
+    log.Printf("gave up after %d attempts: %v", ge.Attempts, ge.Err)
+case err != nil:
+    // single-attempt error, or the caller's context error
+default:
+    defer resp.Body.Close() // may still be a 5xx after retries are exhausted
+}
+```
+
+### Custom classification
+
+Treat a 409 with a marker header as retryable, and never retry a 500 that the
+server flagged as permanent. Return `gotry.Default` to fall back to the
+built-in rules.
+
+```go
+gotry.WithClassifier(func(a gotry.Attempt) gotry.Decision {
+    if a.Response == nil {
+        return gotry.Default
+    }
+    switch {
+    case a.Response.StatusCode == 409 && a.Response.Header.Get("X-Retryable") == "true":
+        return gotry.Retry
+    case a.Response.Header.Get("X-Permanent-Failure") != "":
+        return gotry.DontRetry
+    }
+    return gotry.Default
+})
+```
+
 ## What is retried
 
 An attempt is retried when it is classified as retryable:
@@ -92,10 +221,21 @@ Not retried: TLS certificate errors, DNS "not found", context errors
 per-attempt timeout is distinct and is retried), and every other status or
 error.
 
-A `Classifier` can override this per attempt. It receives an `Attempt`
-(request, response, error, attempt number) and returns `Retry`, `DontRetry`
-or `Default` (use the built-in rules). `ExampleClassifier` retries a 409
-response carrying `X-Retryable: true`.
+A `Classifier` (`func(Attempt) Decision`) can override this per attempt.
+`DefaultClassifier` exposes the built-in rules.
+
+| `Attempt` field | Notes |
+| --- | --- |
+| `Request` | The request for this attempt (a clone). |
+| `Response` | Set when the round trip returned a response; do not read or close its body. |
+| `Err` | Set when the round trip failed; `Response` is nil then. |
+| `Number` | Attempt number (1 for the first). |
+
+| `Decision` | Meaning |
+| --- | --- |
+| `Default` | Defer to the built-in rules. |
+| `Retry` | Retry this attempt. |
+| `DontRetry` | Accept this outcome as final. |
 
 ### Retry-After
 
@@ -157,8 +297,21 @@ the last result is returned.
 ## Circuit breaker
 
 Enabled with `WithCircuitBreaker(BreakerConfig{...})`; state is kept per
-`req.URL.Host`. Zero fields default to `FailureThreshold` 5, `OpenDuration`
-10s, `HalfOpenProbes` 1.
+`req.URL.Host`. Zero fields take their defaults.
+
+| `BreakerConfig` field | Default | Meaning |
+| --- | --- | --- |
+| `FailureThreshold` | 5 | Consecutive failures that open the breaker. |
+| `OpenDuration` | 10s | How long the breaker rejects requests before moving to half-open. |
+| `HalfOpenProbes` | 1 | Probe requests admitted while half-open. |
+
+| `BreakerState` | Behaviour |
+| --- | --- |
+| `Closed` | All requests pass. |
+| `Open` | Requests are rejected with `ErrCircuitOpen`. |
+| `HalfOpen` | Up to `HalfOpenProbes` probes pass; the rest are rejected. |
+
+`BreakerState` implements `String()` (`closed`, `open`, `half-open`).
 
 - Retryable results count as failures. Non-retryable responses (including
   4xx) count as successes. Non-retryable errors with no response, and caller
@@ -189,9 +342,13 @@ without a winner:
   launched it is wrapped in `*gotry.Error` (`Attempts`, `Err`; supports
   `errors.Is` and `errors.As`); a single-attempt error is returned unwrapped.
 
-`Error.Attempts` counts every attempt launched, including cancelled hedges.
+| `gotry.Error` field | Meaning |
+| --- | --- |
+| `Attempts` | Attempts launched, including cancelled hedges. |
+| `Err` | The last attempt's error. `Unwrap` returns it, so `errors.Is` and `errors.As` see through. |
+
 If the caller's context is cancelled or expires, the context's error is
-returned directly.
+returned directly. `ErrCircuitOpen` is a sentinel; match it with `errors.Is`.
 
 ## Hooks
 
@@ -203,9 +360,47 @@ gotry.WithHooks(gotry.Hooks{
 })
 ```
 
+| `RetryEvent` field | Meaning |
+| --- | --- |
+| `Request` | The caller's original request. Do not modify. |
+| `Attempt` | Number of the attempt that just finished and triggered the retry. |
+| `Delay` | How long the transport will wait before it starts. |
+| `StatusCode` | Status of the response that triggered the retry; 0 if there was an error instead. |
+| `Err` | Error that triggered the retry, if any. |
+| `RetryAfter` | True when `Delay` came from a `Retry-After` header rather than the backoff. |
+
+| `HedgeEvent` field | Meaning |
+| --- | --- |
+| `Request` | The caller's original request. Do not modify. |
+| `Attempt` | Number of the hedge about to launch. |
+| `InFlight` | Attempts already in flight. |
+
 All fields are optional. Callbacks run synchronously on the request
 goroutine, so keep them fast. The events carry no response, only the status
 code; the `Request` they carry is the caller's original request, which hooks
 must not modify. A panicking hook is not recovered (the panic propagates out of
 `RoundTrip`). `OnBreakerStateChange` calls are not strictly
 ordered under contention.
+
+## Notes
+
+- **One `Transport` per downstream.** The budget is shared across the whole
+  `Transport`, and breakers are keyed by host within it. Reuse one instance
+  rather than creating one per request, or neither mechanism has any memory.
+- **Safe for concurrent use.** A `Transport` can be shared by many goroutines.
+- **Always close the body.** After exhausted retries you may get a real 5xx
+  response with a nil error; close `resp.Body` as usual.
+- **Put a timeout on every request.** Without a context deadline or
+  `WithPerAttemptTimeout`, a hung attempt blocks the request (and a hung
+  breaker probe holds its slot).
+- **Hedging doubles load on slow paths.** Use it for idempotent, cheap reads,
+  with a delay near your p95 latency, and keep the budget enabled.
+- **Disable a feature by option, not by value.** Budget: `WithBudget(0, 0)`.
+  Retries for one call: `gotry.NoRetry()`. Hedging for one call:
+  `Policy{MaxHedges: -1}`.
+- **Run `go test -race ./...`** when changing the package; the attempt loop is
+  concurrent.
+
+## License
+
+See [LICENSE](LICENSE).
